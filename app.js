@@ -2,6 +2,7 @@ const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
+const crypto = require('crypto');
 
 const app = express();
 const port = 3000;
@@ -9,8 +10,11 @@ const saltRounds = 10;
 const jwtSecret = process.env.JWT_SECRET || 'news-aggregator-dev-secret';
 const newsApiKey = process.env.NEWS_API_KEY;
 const users = new Map();
+const newsCache = new Map();
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const minPasswordLength = 6;
+const newsCacheTtlMs = 5 * 60 * 1000;
+const newsRefreshIntervalMs = 15 * 60 * 1000;
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -109,7 +113,9 @@ const registerUser = async (req, res) => {
         name: name.trim(),
         email: normalizedEmail,
         passwordHash,
-        preferences
+        preferences,
+        readArticles: new Map(),
+        favoriteArticles: new Map()
     });
 
     return res.status(200).json({ message: 'User registered successfully' });
@@ -231,31 +237,197 @@ const buildNewsApiParams = (preferences) => {
     };
 };
 
-const getNews = async (req, res) => {
+const getCacheKey = (params) => `${params.q}:${params.language}`;
+
+const createArticleId = (article) => {
+    const source = article.url || `${article.title || ''}:${article.publishedAt || ''}`;
+    return crypto.createHash('sha1').update(source).digest('hex').slice(0, 12);
+};
+
+const withArticleIds = (articles) => articles.map((article) => ({
+    id: createArticleId(article),
+    ...article
+}));
+
+const ensureUserArticleStores = (user) => {
+    if (!user.readArticles) {
+        user.readArticles = new Map();
+    }
+
+    if (!user.favoriteArticles) {
+        user.favoriteArticles = new Map();
+    }
+};
+
+const fetchArticlesFromNewsApi = async (params) => {
+    const response = await axios.get('https://newsapi.org/v2/everything', {
+        params,
+        timeout: 10000
+    });
+
+    return withArticleIds(response.data.articles || []);
+};
+
+const getCachedArticles = async (preferences, options = {}) => {
+    const { forceRefresh = false, keyword = null } = options;
+    const params = buildNewsApiParams(preferences);
+
+    if (keyword) {
+        params.q = keyword;
+    }
+
+    const cacheKey = getCacheKey(params);
+    const cachedEntry = newsCache.get(cacheKey);
+    const cacheIsFresh = cachedEntry && Date.now() - cachedEntry.updatedAt < newsCacheTtlMs;
+
+    if (!forceRefresh && cacheIsFresh) {
+        return cachedEntry.articles;
+    }
+
     if (!newsApiKey) {
-        return res.status(200).json({
-            news: [],
-            message: 'NEWS_API_KEY is not configured'
+        return cachedEntry ? cachedEntry.articles : [];
+    }
+
+    const articles = await fetchArticlesFromNewsApi(params);
+    newsCache.set(cacheKey, {
+        params,
+        articles,
+        updatedAt: Date.now()
+    });
+
+    return articles;
+};
+
+const refreshCachedNews = async () => {
+    if (!newsApiKey) {
+        return;
+    }
+
+    const cacheEntries = Array.from(newsCache.entries());
+
+    await Promise.all(cacheEntries.map(async ([cacheKey, cacheEntry]) => {
+        const articles = await fetchArticlesFromNewsApi(cacheEntry.params);
+        newsCache.set(cacheKey, {
+            params: cacheEntry.params,
+            articles,
+            updatedAt: Date.now()
         });
+    }));
+};
+
+const handleNewsApiError = (err, res) => {
+    if (err.response && err.response.status === 401) {
+        return res.status(502).json({ message: 'News API authentication failed' });
+    }
+
+    if (err.response && err.response.status === 400) {
+        return res.status(400).json({ message: 'Invalid news API request' });
+    }
+
+    return res.status(502).json({ message: 'Failed to fetch news articles' });
+};
+
+const findCachedArticleById = async (articleId, preferences) => {
+    const preferredArticles = await getCachedArticles(preferences);
+    const preferredArticle = preferredArticles.find((article) => article.id === articleId);
+
+    if (preferredArticle) {
+        return preferredArticle;
+    }
+
+    for (const cacheEntry of newsCache.values()) {
+        const article = cacheEntry.articles.find((cachedArticle) => cachedArticle.id === articleId);
+
+        if (article) {
+            return article;
+        }
+    }
+
+    return { id: articleId };
+};
+
+const getNews = async (req, res) => {
+    try {
+        const articles = await getCachedArticles(req.user.preferences);
+        const responseBody = { news: articles };
+
+        if (!newsApiKey) {
+            responseBody.message = 'NEWS_API_KEY is not configured';
+        }
+
+        return res.status(200).json(responseBody);
+    } catch (err) {
+        return handleNewsApiError(err, res);
+    }
+};
+
+const markArticleAsRead = async (req, res) => {
+    try {
+        ensureUserArticleStores(req.user);
+        const article = await findCachedArticleById(req.params.id, req.user.preferences);
+
+        req.user.readArticles.set(req.params.id, article);
+
+        return res.status(200).json({ message: 'Article marked as read', article });
+    } catch (err) {
+        return handleNewsApiError(err, res);
+    }
+};
+
+const markArticleAsFavorite = async (req, res) => {
+    try {
+        ensureUserArticleStores(req.user);
+        const article = await findCachedArticleById(req.params.id, req.user.preferences);
+
+        req.user.favoriteArticles.set(req.params.id, article);
+
+        return res.status(200).json({ message: 'Article marked as favorite', article });
+    } catch (err) {
+        return handleNewsApiError(err, res);
+    }
+};
+
+const getReadArticles = (req, res) => {
+    ensureUserArticleStores(req.user);
+
+    return res.status(200).json({ news: Array.from(req.user.readArticles.values()) });
+};
+
+const getFavoriteArticles = (req, res) => {
+    ensureUserArticleStores(req.user);
+
+    return res.status(200).json({ news: Array.from(req.user.favoriteArticles.values()) });
+};
+
+const searchNews = async (req, res) => {
+    const { keyword } = req.params;
+
+    if (!isNonEmptyString(keyword)) {
+        return res.status(400).json({ message: 'Search keyword is required' });
     }
 
     try {
-        const response = await axios.get('https://newsapi.org/v2/everything', {
-            params: buildNewsApiParams(req.user.preferences),
-            timeout: 10000
+        const articles = await getCachedArticles(req.user.preferences, { keyword: keyword.trim() });
+        const normalizedKeyword = keyword.trim().toLowerCase();
+        const matchingArticles = articles.filter((article) => {
+            const searchableText = [
+                article.title,
+                article.description,
+                article.content,
+                article.source && article.source.name
+            ].filter(Boolean).join(' ').toLowerCase();
+
+            return searchableText.includes(normalizedKeyword);
         });
+        const responseBody = { news: matchingArticles };
 
-        return res.status(200).json({ news: response.data.articles || [] });
+        if (!newsApiKey) {
+            responseBody.message = 'NEWS_API_KEY is not configured';
+        }
+
+        return res.status(200).json(responseBody);
     } catch (err) {
-        if (err.response && err.response.status === 401) {
-            return res.status(502).json({ message: 'News API authentication failed' });
-        }
-
-        if (err.response && err.response.status === 400) {
-            return res.status(400).json({ message: 'Invalid news API request' });
-        }
-
-        return res.status(502).json({ message: 'Failed to fetch news articles' });
+        return handleNewsApiError(err, res);
     }
 };
 
@@ -267,6 +439,11 @@ app.get('/preferences', authenticateToken, getPreferences);
 app.put('/preferences', authenticateToken, updatePreferences);
 app.get('/users/preferences', authenticateToken, getPreferences);
 app.put('/users/preferences', authenticateToken, updatePreferences);
+app.get('/news/read', authenticateToken, getReadArticles);
+app.get('/news/favorites', authenticateToken, getFavoriteArticles);
+app.get('/news/search/:keyword', authenticateToken, searchNews);
+app.post('/news/:id/read', authenticateToken, markArticleAsRead);
+app.post('/news/:id/favorite', authenticateToken, markArticleAsFavorite);
 app.get('/news', authenticateToken, getNews);
 
 app.use((err, req, res, next) => {
@@ -280,6 +457,14 @@ app.use((err, req, res, next) => {
 app.use((err, req, res, next) => {
     return res.status(500).json({ message: 'Internal server error' });
 });
+
+const cacheRefreshTimer = setInterval(() => {
+    refreshCachedNews().catch(() => {});
+}, newsRefreshIntervalMs);
+
+if (cacheRefreshTimer.unref) {
+    cacheRefreshTimer.unref();
+}
 
 if (require.main === module) {
     app.listen(port, (err) => {
