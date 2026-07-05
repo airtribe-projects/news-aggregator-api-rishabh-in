@@ -1,11 +1,13 @@
 const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const axios = require('axios');
 
 const app = express();
 const port = 3000;
 const saltRounds = 10;
 const jwtSecret = process.env.JWT_SECRET || 'news-aggregator-dev-secret';
+const newsApiKey = process.env.NEWS_API_KEY;
 const users = new Map();
 
 app.use(express.json());
@@ -100,6 +102,75 @@ const updatePreferences = (req, res) => {
     return res.status(200).json({ preferences: req.user.preferences });
 };
 
+const normalizePreferenceList = (value) => {
+    if (!value) {
+        return [];
+    }
+
+    if (Array.isArray(value)) {
+        return value.filter(Boolean);
+    }
+
+    if (typeof value === 'string') {
+        return value.split(',').map((item) => item.trim()).filter(Boolean);
+    }
+
+    return [];
+};
+
+const buildNewsApiParams = (preferences) => {
+    const categories = Array.isArray(preferences)
+        ? preferences
+        : normalizePreferenceList(
+            typeof preferences === 'string'
+                ? preferences
+                : preferences.categories || preferences.category || preferences.topics
+        );
+    const languages = Array.isArray(preferences)
+        ? []
+        : normalizePreferenceList(
+            typeof preferences === 'string'
+                ? null
+                : preferences.languages || preferences.language
+        );
+
+    return {
+        q: categories.length > 0 ? categories.join(' OR ') : 'news',
+        language: languages[0] || 'en',
+        sortBy: 'publishedAt',
+        pageSize: 20,
+        apiKey: newsApiKey
+    };
+};
+
+const getNews = async (req, res) => {
+    if (!newsApiKey) {
+        return res.status(200).json({
+            news: [],
+            message: 'NEWS_API_KEY is not configured'
+        });
+    }
+
+    try {
+        const response = await axios.get('https://newsapi.org/v2/everything', {
+            params: buildNewsApiParams(req.user.preferences),
+            timeout: 10000
+        });
+
+        return res.status(200).json({ news: response.data.articles || [] });
+    } catch (err) {
+        if (err.response && err.response.status === 401) {
+            return res.status(502).json({ message: 'News API authentication failed' });
+        }
+
+        if (err.response && err.response.status === 400) {
+            return res.status(400).json({ message: 'Invalid news API request' });
+        }
+
+        return res.status(502).json({ message: 'Failed to fetch news articles' });
+    }
+};
+
 app.post('/register', registerUser);
 app.post('/login', loginUser);
 app.post('/users/signup', registerUser);
@@ -108,6 +179,7 @@ app.get('/preferences', authenticateToken, getPreferences);
 app.put('/preferences', authenticateToken, updatePreferences);
 app.get('/users/preferences', authenticateToken, getPreferences);
 app.put('/users/preferences', authenticateToken, updatePreferences);
+app.get('/news', authenticateToken, getNews);
 
 if (require.main === module) {
     app.listen(port, (err) => {
