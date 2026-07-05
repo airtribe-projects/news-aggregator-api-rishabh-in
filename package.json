@@ -5,7 +5,7 @@
     "main": "index.js",
     "scripts": {
         "pretest": "node -e \"if (process.version.slice(1).split('.')[0] < 18) { console.error('Unsupported Node.js version, please use version 18'); process.exit(1); }\"",
-        "test": "tap test/*.js --disable-coverage"
+        "test": "node test/server.test.js"
     },
     "author": "Airtribe",
     "license": "ISC",
