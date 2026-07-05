@@ -9,25 +9,105 @@ const saltRounds = 10;
 const jwtSecret = process.env.JWT_SECRET || 'news-aggregator-dev-secret';
 const newsApiKey = process.env.NEWS_API_KEY;
 const users = new Map();
+const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const minPasswordLength = 6;
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const registerUser = async (req, res) => {
-    const { name, email, password, preferences = [] } = req.body;
+const isNonEmptyString = (value) => typeof value === 'string' && value.trim().length > 0;
 
-    if (!name || !email || !password) {
-        return res.status(400).json({ message: 'Name, email, and password are required' });
+const validatePreferenceValue = (value, fieldName) => {
+    if (Array.isArray(value)) {
+        if (value.length === 0) {
+            return `${fieldName} must include at least one value`;
+        }
+
+        if (!value.every(isNonEmptyString)) {
+            return `${fieldName} must contain only non-empty strings`;
+        }
+
+        return null;
     }
 
-    if (users.has(email)) {
+    if (isNonEmptyString(value)) {
+        return null;
+    }
+
+    return `${fieldName} must be a non-empty string or an array of strings`;
+};
+
+const validatePreferences = (preferences, options = {}) => {
+    const { required = false } = options;
+
+    if (preferences === undefined || preferences === null) {
+        return required ? ['Preferences are required'] : [];
+    }
+
+    if (Array.isArray(preferences)) {
+        const error = validatePreferenceValue(preferences, 'preferences');
+        return error ? [error] : [];
+    }
+
+    if (isNonEmptyString(preferences)) {
+        return [];
+    }
+
+    if (typeof preferences !== 'object') {
+        return ['Preferences must be an array, object, or comma-separated string'];
+    }
+
+    const preferenceKeys = Object.keys(preferences);
+
+    if (preferenceKeys.length === 0) {
+        return required ? ['Preferences are required'] : [];
+    }
+
+    return preferenceKeys
+        .map((key) => validatePreferenceValue(preferences[key], key))
+        .filter(Boolean);
+};
+
+const validateRegistrationInput = ({ name, email, password, preferences }) => {
+    const errors = [];
+
+    if (!isNonEmptyString(name)) {
+        errors.push('Name is required');
+    }
+
+    if (!isNonEmptyString(email)) {
+        errors.push('Email is required');
+    } else if (!emailPattern.test(email)) {
+        errors.push('Email must be valid');
+    }
+
+    if (!isNonEmptyString(password)) {
+        errors.push('Password is required');
+    } else if (password.length < minPasswordLength) {
+        errors.push(`Password must be at least ${minPasswordLength} characters long`);
+    }
+
+    return errors.concat(validatePreferences(preferences));
+};
+
+const registerUser = async (req, res) => {
+    const { name, email, password, preferences = [] } = req.body;
+    const errors = validateRegistrationInput(req.body);
+
+    if (errors.length > 0) {
+        return res.status(400).json({ message: 'Invalid registration input', errors });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    if (users.has(normalizedEmail)) {
         return res.status(409).json({ message: 'User already exists' });
     }
 
     const passwordHash = await bcrypt.hash(password, saltRounds);
-    users.set(email, {
-        name,
-        email,
+    users.set(normalizedEmail, {
+        name: name.trim(),
+        email: normalizedEmail,
         passwordHash,
         preferences
     });
@@ -38,11 +118,15 @@ const registerUser = async (req, res) => {
 const loginUser = async (req, res) => {
     const { email, password } = req.body;
 
-    if (!email || !password) {
+    if (!isNonEmptyString(email) || !isNonEmptyString(password)) {
         return res.status(400).json({ message: 'Email and password are required' });
     }
 
-    const user = users.get(email);
+    if (!emailPattern.test(email)) {
+        return res.status(400).json({ message: 'Email must be valid' });
+    }
+
+    const user = users.get(email.trim().toLowerCase());
 
     if (!user) {
         return res.status(401).json({ message: 'Invalid email or password' });
@@ -61,16 +145,19 @@ const loginUser = async (req, res) => {
 
 const authenticateToken = (req, res, next) => {
     const authorizationHeader = req.headers.authorization;
-    const token = authorizationHeader && authorizationHeader.split(' ')[0] === 'Bearer'
-        ? authorizationHeader.split(' ')[1]
+    const [scheme, token] = authorizationHeader
+        ? authorizationHeader.trim().split(/\s+/)
+        : [];
+    const bearerToken = scheme === 'Bearer'
+        ? token
         : null;
 
-    if (!token) {
+    if (!bearerToken) {
         return res.status(401).json({ message: 'Authorization token is required' });
     }
 
     try {
-        const decodedToken = jwt.verify(token, jwtSecret);
+        const decodedToken = jwt.verify(bearerToken, jwtSecret);
         const user = users.get(decodedToken.email);
 
         if (!user) {
@@ -92,9 +179,10 @@ const updatePreferences = (req, res) => {
     const preferences = Object.prototype.hasOwnProperty.call(req.body, 'preferences')
         ? req.body.preferences
         : req.body;
+    const errors = validatePreferences(preferences, { required: true });
 
-    if (!preferences || (typeof preferences === 'object' && !Array.isArray(preferences) && Object.keys(preferences).length === 0)) {
-        return res.status(400).json({ message: 'Preferences are required' });
+    if (errors.length > 0) {
+        return res.status(400).json({ message: 'Invalid preferences input', errors });
     }
 
     req.user.preferences = preferences;
@@ -180,6 +268,18 @@ app.put('/preferences', authenticateToken, updatePreferences);
 app.get('/users/preferences', authenticateToken, getPreferences);
 app.put('/users/preferences', authenticateToken, updatePreferences);
 app.get('/news', authenticateToken, getNews);
+
+app.use((err, req, res, next) => {
+    if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+        return res.status(400).json({ message: 'Invalid JSON request body' });
+    }
+
+    return next(err);
+});
+
+app.use((err, req, res, next) => {
+    return res.status(500).json({ message: 'Internal server error' });
+});
 
 if (require.main === module) {
     app.listen(port, (err) => {
